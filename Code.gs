@@ -1,21 +1,276 @@
 /**
  * Google Driveの特定のフォルダ内のファイルとフォルダ情報を取得し、各フォルダ名のシートに出力します
  * 新しいファイルやフォルダが追加された場合には、メールで通知されます
- * 
+ *
  * 【改善版】共有ドライブ対応、URL処理改善、エラーハンドリング強化、シート名の重複防止
  *
  * 使い方:
- * 1. ドライブ内の監視したいフォルダディレクトリのURLまたはフォルダIDをmainシートのB列に入力します
- * 2. mainシートのA列には、その行のフォルダ監視が有効かどうかを表すTRUE/FALSEを入力します
- * 3. mainシートのF列にはメール送信先のアドレスを入力します
- * 4. スクリプトのトリガーを設定して、定期的にcheckNewFiles()関数が実行されるように設定します
+ * 1. スプレッドシートを開くとカスタムメニュー「ドライブ監視」が表示されます
+ * 2. 「初期セットアップ」を実行するとmainシートが自動作成されます
+ * 3. mainシートのB列に監視したいフォルダのURLまたはIDを入力します
+ * 4. 「今すぐチェック実行」でテスト、「自動実行を設定」で定期実行を設定します
  *
  * 注意点:
- * - Google App Scriptのプロジェクト名は任意です 
+ * - Google App Scriptのプロジェクト名は任意です
  * - フォルダの階層が変わると影響してしまうため、可能であればフォルダ構成は変更しないでください
  * - フォルダに新しいファイルやフォルダが追加されずに更新された場合、メール送信は行われません
  * - 共有ドライブのフォルダを監視する場合は、Drive APIが有効になっている必要があります
  */
+
+// ============================================
+// カスタムメニューと初期セットアップ
+// ============================================
+
+/**
+ * スプレッドシートを開いたときにカスタムメニューを追加
+ */
+function onOpen() {
+  var ui = SpreadsheetApp.getUi();
+  ui.createMenu('ドライブ監視')
+    .addItem('初期セットアップ', 'setupSheet')
+    .addSeparator()
+    .addItem('今すぐチェック実行', 'checkNewFilesWithNotification')
+    .addSeparator()
+    .addSubMenu(ui.createMenu('自動実行設定')
+      .addItem('1時間ごとに自動実行', 'setupHourlyTrigger')
+      .addItem('6時間ごとに自動実行', 'setupSixHourlyTrigger')
+      .addItem('毎日自動実行', 'setupDailyTrigger')
+      .addItem('自動実行を停止', 'removeTriggersWithNotification'))
+    .addSeparator()
+    .addItem('サンプル行を追加', 'addSampleRow')
+    .addItem('使い方を表示', 'showHelp')
+    .addToUi();
+}
+
+/**
+ * 初期セットアップ - mainシートとヘッダーを自動作成
+ */
+function setupSheet() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var mainSheet = ss.getSheetByName('main');
+
+  // mainシートがなければ作成
+  if (!mainSheet) {
+    // 最初のシートをmainにリネームするか、新規作成
+    var sheets = ss.getSheets();
+    if (sheets.length === 1 && sheets[0].getLastRow() === 0) {
+      // 空のシートが1つだけならリネーム
+      mainSheet = sheets[0];
+      mainSheet.setName('main');
+    } else {
+      // 新規作成
+      mainSheet = ss.insertSheet('main', 0);
+    }
+  }
+
+  // ヘッダー行を設定
+  var headers = ['有効化', 'フォルダURL/ID', 'フォルダ名', '最終更新日時', 'オーナー', 'メール送信先', 'エラー'];
+  mainSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+
+  // ヘッダー行の書式設定
+  var headerRange = mainSheet.getRange(1, 1, 1, headers.length);
+  headerRange.setFontWeight('bold');
+  headerRange.setBackground('#4285f4');
+  headerRange.setFontColor('#ffffff');
+
+  // 列幅を調整
+  mainSheet.setColumnWidth(1, 80);   // 有効化
+  mainSheet.setColumnWidth(2, 300);  // フォルダURL/ID
+  mainSheet.setColumnWidth(3, 150);  // フォルダ名
+  mainSheet.setColumnWidth(4, 150);  // 最終更新日時
+  mainSheet.setColumnWidth(5, 200);  // オーナー
+  mainSheet.setColumnWidth(6, 200);  // メール送信先
+  mainSheet.setColumnWidth(7, 250);  // エラー
+
+  // A列にデータ入力規則（チェックボックス）を設定
+  var checkboxRule = SpreadsheetApp.newDataValidation()
+    .requireCheckbox()
+    .build();
+  mainSheet.getRange(2, 1, 100, 1).setDataValidation(checkboxRule);
+
+  // 1行目を固定
+  mainSheet.setFrozenRows(1);
+
+  // mainシートをアクティブにする
+  ss.setActiveSheet(mainSheet);
+
+  SpreadsheetApp.getUi().alert(
+    'セットアップ完了',
+    'mainシートを作成しました。\n\n' +
+    '【次のステップ】\n' +
+    '1. A列のチェックボックスをONにする\n' +
+    '2. B列に監視したいフォルダのURLを貼り付け\n' +
+    '3. F列に通知先メールアドレスを入力\n' +
+    '4. メニューから「今すぐチェック実行」を選択',
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+/**
+ * サンプル行を追加
+ */
+function addSampleRow() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var mainSheet = ss.getSheetByName('main');
+
+  if (!mainSheet) {
+    SpreadsheetApp.getUi().alert('エラー', 'mainシートが見つかりません。\n先に「初期セットアップ」を実行してください。', SpreadsheetApp.getUi().ButtonSet.OK);
+    return;
+  }
+
+  // 次の空き行を探す
+  var lastRow = mainSheet.getLastRow();
+  var newRow = lastRow + 1;
+
+  // サンプルデータを追加
+  mainSheet.getRange(newRow, 1).setValue(false);
+  mainSheet.getRange(newRow, 2).setValue('ここにフォルダURLまたはIDを貼り付け');
+  mainSheet.getRange(newRow, 6).setValue('your-email@example.com');
+
+  // チェックボックスを設定
+  var checkboxRule = SpreadsheetApp.newDataValidation()
+    .requireCheckbox()
+    .build();
+  mainSheet.getRange(newRow, 1).setDataValidation(checkboxRule);
+
+  SpreadsheetApp.getUi().alert(
+    'サンプル行を追加しました',
+    '行 ' + newRow + ' にサンプルを追加しました。\n\n' +
+    '【設定方法】\n' +
+    '1. B列にGoogle ドライブのフォルダURLを貼り付け\n' +
+    '2. F列に通知先メールアドレスを入力\n' +
+    '3. A列のチェックボックスをONにする',
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+/**
+ * 使い方を表示
+ */
+function showHelp() {
+  var helpText =
+    '【ドライブ監視システムの使い方】\n\n' +
+    '■ 初期設定\n' +
+    '1. 「初期セットアップ」を実行\n' +
+    '2. B列に監視したいフォルダのURLを貼り付け\n' +
+    '3. F列に通知先メールアドレスを入力\n' +
+    '4. A列のチェックボックスをONにする\n\n' +
+    '■ 動作確認\n' +
+    '「今すぐチェック実行」で手動テスト\n\n' +
+    '■ 自動実行\n' +
+    '「自動実行設定」から実行間隔を選択\n\n' +
+    '■ 共有ドライブを使う場合\n' +
+    'Drive APIの有効化が必要です\n' +
+    '（サービス→Drive API を追加）\n\n' +
+    '■ 詳細な手順書\n' +
+    'https://github.com/itoksk/drive-app';
+
+  SpreadsheetApp.getUi().alert('使い方', helpText, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/**
+ * チェック実行（通知付き）
+ */
+function checkNewFilesWithNotification() {
+  var ui = SpreadsheetApp.getUi();
+
+  try {
+    checkNewFiles();
+    ui.alert(
+      'チェック完了',
+      'フォルダのチェックが完了しました。\n\n' +
+      '結果はmainシートと各フォルダのシートを確認してください。\n' +
+      'エラーがある場合はG列に表示されます。',
+      ui.ButtonSet.OK
+    );
+  } catch (e) {
+    ui.alert(
+      'エラーが発生しました',
+      'チェック中にエラーが発生しました。\n\n' +
+      'エラー内容: ' + e.toString() + '\n\n' +
+      '【確認事項】\n' +
+      '・mainシートが存在するか\n' +
+      '・フォルダURLが正しいか\n' +
+      '・フォルダへのアクセス権限があるか',
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+/**
+ * 1時間ごとのトリガーを設定
+ */
+function setupHourlyTrigger() {
+  removeTriggers();
+  ScriptApp.newTrigger('checkNewFiles')
+    .timeBased()
+    .everyHours(1)
+    .create();
+  SpreadsheetApp.getUi().alert('自動実行設定完了', '1時間ごとに自動実行するように設定しました。', SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/**
+ * 6時間ごとのトリガーを設定
+ */
+function setupSixHourlyTrigger() {
+  removeTriggers();
+  ScriptApp.newTrigger('checkNewFiles')
+    .timeBased()
+    .everyHours(6)
+    .create();
+  SpreadsheetApp.getUi().alert('自動実行設定完了', '6時間ごとに自動実行するように設定しました。', SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/**
+ * 毎日のトリガーを設定
+ */
+function setupDailyTrigger() {
+  removeTriggers();
+  ScriptApp.newTrigger('checkNewFiles')
+    .timeBased()
+    .everyDays(1)
+    .atHour(9)
+    .create();
+  SpreadsheetApp.getUi().alert('自動実行設定完了', '毎日9時に自動実行するように設定しました。', SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/**
+ * すべてのトリガーを削除
+ */
+function removeTriggers() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'checkNewFiles') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+}
+
+/**
+ * トリガー削除（UIから呼び出し用）
+ */
+function removeTriggersWithNotification() {
+  removeTriggers();
+  SpreadsheetApp.getUi().alert('自動実行を停止しました', 'すべての自動実行設定を削除しました。', SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/**
+ * スプレッドシート名の末尾にV2を追加
+ */
+function renameToV2() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var currentName = ss.getName();
+  if (!currentName.endsWith('V2')) {
+    ss.rename(currentName + ' V2');
+    SpreadsheetApp.getUi().alert('リネーム完了', 'スプレッドシート名を「' + currentName + ' V2」に変更しました。', SpreadsheetApp.getUi().ButtonSet.OK);
+  } else {
+    SpreadsheetApp.getUi().alert('確認', '既にV2が付いています。', SpreadsheetApp.getUi().ButtonSet.OK);
+  }
+}
+
+// ============================================
+// メイン処理
+// ============================================
 
 // Googleドライブの新規ファイルやフォルダの変更をチェックする関数
 function checkNewFiles() {
