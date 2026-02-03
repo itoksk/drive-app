@@ -2,6 +2,8 @@
 
 Google ドライブの特定フォルダに新しいファイルやフォルダが追加された際に、自動でメール通知を送信するGoogle Apps Script（GAS）プログラムです。
 
+**GitHubリポジトリ**: https://github.com/itoksk/drive-app
+
 ## 🆕 改善版の主な変更点
 
 ### 修正された不具合
@@ -206,4 +208,4 @@ function enableDriveAPI() {
 
 ## 🤝 貢献
 
-不具合報告や改善提案は、GitHubのIssuesまたは元のnote記事のコメントでお願いします。
+不具合報告や改善提案は、[GitHubのIssues](https://github.com/itoksk/drive-app/issues)または元のnote記事のコメントでお願いします。
