@@ -2,7 +2,7 @@
  * Google Driveの特定のフォルダ内のファイルとフォルダ情報を取得し、各フォルダ名のシートに出力します
  * 新しいファイルやフォルダが追加された場合には、メールで通知されます
  * 
- * 【改善版】共有ドライブ対応、URL処理改善、エラーハンドリング強化
+ * 【改善版】共有ドライブ対応、URL処理改善、エラーハンドリング強化、シート名の重複防止
  *
  * 使い方:
  * 1. ドライブ内の監視したいフォルダディレクトリのURLまたはフォルダIDをmainシートのB列に入力します
@@ -60,23 +60,28 @@ function checkNewFiles() {
             continue;
           }
           
-          // フォルダを取得します（共有ドライブ対応）
-          var folder = getFolderById(folderId);
+          // フォルダ情報を取得します（共有ドライブ対応）
+          var folderMeta = getFolderMetadata(folderId);
           
-          if (!folder) {
+          if (!folderMeta) {
             Logger.log('行 ' + (i + 1) + ': フォルダIDが無効です: ' + folderId);
             updateErrorStatus(mainSheet, i + 1, 'フォルダIDが無効です: ' + folderId);
             continue;
           }
           
+          if (folderMeta.errorMessage) {
+            Logger.log('行 ' + (i + 1) + ': ' + folderMeta.errorMessage);
+            updateErrorStatus(mainSheet, i + 1, folderMeta.errorMessage);
+            continue;
+          }
+          
           // フォルダ名を取得します
-          var folderName = folder.getName();
+          var folderName = folderMeta.name;
 
           // フォルダ名、最終更新日、オーナーを更新します (列 3, 4, 5)
           try {
-            var ownerEmail = getOwnerEmail(folder);
             mainSheet.getRange(i + 1, 3, 1, 3).setValues([
-              [folderName, new Date(), ownerEmail]
+              [folderName, new Date(), folderMeta.ownerEmail || '取得不可']
             ]);
           } catch (e) {
             Logger.log('行 ' + (i + 1) + ': フォルダ情報の更新でエラー: ' + e.toString());
@@ -86,22 +91,25 @@ function checkNewFiles() {
           }
 
           // 新しいフォルダの内容を出力し、新しいURLを取得します
-          var sheet = ss.getSheetByName(folderName);
+          var sheet = getOrCreateFolderSheet(ss, folderId, folderName);
           if (!sheet) {
-            // 指定名のシートが存在しない場合、新しく作成します
-            sheet = createSheet(ss, folderName);
-            if (!sheet) {
-              Logger.log('行 ' + (i + 1) + ': シートの作成に失敗しました: ' + folderName);
-              updateErrorStatus(mainSheet, i + 1, 'シートの作成に失敗しました');
-              continue;
-            }
+            Logger.log('行 ' + (i + 1) + ': シートの作成に失敗しました: ' + folderName);
+            updateErrorStatus(mainSheet, i + 1, 'シートの作成に失敗しました');
+            continue;
           }
 
           // 既存のURLを取得します
-          var existingUrls = getExistingUrls(ss, folderName);
+          var existingUrls = getExistingUrls(sheet);
           
           // フォルダ内容を出力し、新規のファイルとフォルダを取得します
-          var newFilesAndFolders = outputFolderContents(folderId, sheet, existingUrls);
+          var newFilesAndFolders = outputFolderContents(
+            folderId,
+            folderName,
+            sheet,
+            existingUrls,
+            folderMeta.useDriveApiOnly,
+            folderMeta.driveId
+          );
 
           // 新しいファイルやフォルダがある場合、メールを送信します
           if (newFilesAndFolders.length > 0) {
@@ -148,6 +156,68 @@ function checkNewFiles() {
 function isHeaderRow(row) {
   // 最初の列がチェックボックス的な値でない場合、ヘッダー行と判断
   return row[0] !== true && row[0] !== false && row[0] !== 'TRUE' && row[0] !== 'FALSE';
+}
+
+// フォルダ情報を取得する関数（DriveApp優先、共有ドライブはDrive APIで対応）
+function getFolderMetadata(folderId) {
+  try {
+    var folder = DriveApp.getFolderById(folderId);
+    return {
+      name: folder.getName(),
+      ownerEmail: getOwnerEmail(folder),
+      useDriveApiOnly: false,
+      driveId: null
+    };
+  } catch (e) {
+    Logger.log('DriveAppで取得失敗、Drive APIを試行: ' + e.toString());
+  }
+
+  var fileData = fetchDriveFileMetadata(folderId, 'id,name,mimeType,owners,driveId');
+  if (!fileData) {
+    return null;
+  }
+  if (fileData.mimeType !== 'application/vnd.google-apps.folder') {
+    return { errorMessage: '指定IDはフォルダではありません: ' + folderId };
+  }
+
+  return {
+    name: fileData.name || '（名称不明）',
+    ownerEmail: extractOwnerEmailFromApi(fileData),
+    useDriveApiOnly: true,
+    driveId: fileData.driveId || null
+  };
+}
+
+// Drive APIでファイル/フォルダのメタデータを取得する関数（共有ドライブ対応）
+function fetchDriveFileMetadata(fileId, fields) {
+  try {
+    var url = 'https://www.googleapis.com/drive/v3/files/' + fileId +
+      '?fields=' + encodeURIComponent(fields) +
+      '&supportsAllDrives=true';
+    var response = UrlFetchApp.fetch(url, {
+      headers: {
+        'Authorization': 'Bearer ' + ScriptApp.getOAuthToken()
+      },
+      muteHttpExceptions: true
+    });
+
+    if (response.getResponseCode() === 200) {
+      return JSON.parse(response.getContentText());
+    }
+
+    Logger.log('Drive API files.get エラー: ' + response.getResponseCode() + ' ' + response.getContentText());
+  } catch (e) {
+    Logger.log('Drive API files.get 失敗: ' + e.toString());
+  }
+  return null;
+}
+
+// Drive APIレスポンスからオーナーのメールアドレスを取得
+function extractOwnerEmailFromApi(fileData) {
+  if (fileData && fileData.owners && fileData.owners.length > 0) {
+    return fileData.owners[0].emailAddress || '取得不可';
+  }
+  return '取得不可';
 }
 
 // エラー状態を更新する関数
@@ -207,77 +277,21 @@ function extractFolderId(urlOrId) {
   return null;
 }
 
-// フォルダIDからフォルダを取得する関数（共有ドライブ対応）
-function getFolderById(folderId) {
-  try {
-    // まず通常のDriveAppで試行（マイドライブ用）
-    try {
-      var folder = DriveApp.getFolderById(folderId);
-      if (folder) {
-        return folder;
-      }
-    } catch (e) {
-      // DriveAppで取得できない場合は共有ドライブの可能性
-      Logger.log('DriveAppで取得失敗、Drive APIを試行: ' + e.toString());
-    }
-    
-    // Drive APIを使用して共有ドライブのフォルダを取得
-    try {
-      var driveApiUrl = 'https://www.googleapis.com/drive/v3/files/' + folderId + '?fields=id,name,mimeType,parents';
-      var response = UrlFetchApp.fetch(driveApiUrl, {
-        headers: {
-          'Authorization': 'Bearer ' + ScriptApp.getOAuthToken()
-        }
-      });
-      
-      if (response.getResponseCode() === 200) {
-        var fileData = JSON.parse(response.getContentText());
-        if (fileData.mimeType === 'application/vnd.google-apps.folder') {
-          // Drive APIで取得できた場合でも、DriveAppのオブジェクトが必要な場合は
-          // 別の方法で処理する必要がある
-          // ここでは簡易的にDriveAppで再試行
-          try {
-            return DriveApp.getFolderById(folderId);
-          } catch (e2) {
-            // DriveAppで取得できない場合は、Drive APIの結果を使って処理を続行
-            // この場合、getFiles()やgetFolders()が使えないため、Drive APIで再帰的に取得する必要がある
-            Logger.log('共有ドライブフォルダを検出: ' + fileData.name);
-            // 共有ドライブの場合は、Drive APIを使用した処理に切り替える
-            return createSharedDriveFolderWrapper(folderId, fileData);
-          }
-        }
-      }
-    } catch (e) {
-      Logger.log('Drive APIでの取得も失敗: ' + e.toString());
-    }
-    
-    return null;
-  } catch (e) {
-    Logger.log('getFolderByIdでエラー: ' + e.toString());
-    return null;
-  }
-}
-
-// 共有ドライブフォルダのラッパーオブジェクト
-// Drive APIを使用してファイル一覧を取得する実装
-function createSharedDriveFolderWrapper(folderId, fileData) {
-  // Drive APIを使用してフォルダを取得する方法を試行
-  // ただし、DriveAppのオブジェクトが必要なため、可能な限りDriveAppで取得を試みる
-  try {
-    // 再度DriveAppで試行（権限が付与された後は取得できる可能性がある）
-    return DriveApp.getFolderById(folderId);
-  } catch (e) {
-    Logger.log('共有ドライブフォルダの取得に失敗: ' + e.toString());
-    Logger.log('Drive APIを使用した処理が必要です。Drive APIが有効になっているか確認してください。');
-    throw new Error('共有ドライブのフォルダにアクセスできません。Drive APIの有効化と適切な権限が必要です。エラー: ' + e.toString());
-  }
-}
-
 // Drive APIを使用してフォルダ内のファイル一覧を取得する関数（共有ドライブ用）
-function getFilesFromDriveAPI(folderId, pageToken) {
+function getFilesFromDriveAPI(folderId, pageToken, driveId) {
   try {
     var query = "'" + folderId + "' in parents and trashed=false";
-    var url = 'https://www.googleapis.com/drive/v3/files?q=' + encodeURIComponent(query) + '&fields=nextPageToken,files(id,name,mimeType,modifiedTime,webViewLink,owners)';
+    var url = 'https://www.googleapis.com/drive/v3/files' +
+      '?q=' + encodeURIComponent(query) +
+      '&fields=nextPageToken,files(id,name,mimeType,modifiedTime,webViewLink,owners)' +
+      '&pageSize=1000' +
+      '&supportsAllDrives=true' +
+      '&includeItemsFromAllDrives=true' +
+      '&spaces=drive';
+
+    if (driveId) {
+      url += '&corpora=drive&driveId=' + encodeURIComponent(driveId);
+    }
     
     if (pageToken) {
       url += '&pageToken=' + encodeURIComponent(pageToken);
@@ -286,13 +300,15 @@ function getFilesFromDriveAPI(folderId, pageToken) {
     var response = UrlFetchApp.fetch(url, {
       headers: {
         'Authorization': 'Bearer ' + ScriptApp.getOAuthToken()
-      }
+      },
+      muteHttpExceptions: true
     });
     
     if (response.getResponseCode() === 200) {
       return JSON.parse(response.getContentText());
     } else {
       Logger.log('Drive APIリクエストエラー: ' + response.getResponseCode());
+      Logger.log(response.getContentText());
       return null;
     }
   } catch (e) {
@@ -313,21 +329,10 @@ function getOwnerEmail(folder) {
   }
   
   try {
-    // 代替方法: Drive APIを使用
+    // 代替方法: Drive APIを使用（共有ドライブ対応）
     var folderId = folder.getId();
-    var driveApiUrl = 'https://www.googleapis.com/drive/v3/files/' + folderId + '?fields=owners';
-    var response = UrlFetchApp.fetch(driveApiUrl, {
-      headers: {
-        'Authorization': 'Bearer ' + ScriptApp.getOAuthToken()
-      }
-    });
-    
-    if (response.getResponseCode() === 200) {
-      var fileData = JSON.parse(response.getContentText());
-      if (fileData.owners && fileData.owners.length > 0) {
-        return fileData.owners[0].emailAddress;
-      }
-    }
+    var fileData = fetchDriveFileMetadata(folderId, 'owners');
+    return extractOwnerEmailFromApi(fileData);
   } catch (e) {
     Logger.log('Drive APIでのオーナー取得も失敗: ' + e.toString());
   }
@@ -336,8 +341,7 @@ function getOwnerEmail(folder) {
 }
 
 // シートに存在するURLを取得する関数
-function getExistingUrls(ss, folderName) {
-  var sheet = ss.getSheetByName(folderName);
+function getExistingUrls(sheet) {
   // シートが存在しない、またはシートの行数が2未満の場合、空の配列を返します
   if (!sheet || sheet.getLastRow() < 2) {
     return [];
@@ -355,46 +359,28 @@ function getExistingUrls(ss, folderName) {
 }
 
 // フォルダの内容を出力し、新しいファイルとフォルダをフィルタリングする関数
-function outputFolderContents(folderId, sheet, existingUrls) {
+function outputFolderContents(folderId, folderName, sheet, existingUrls, useDriveApiOnly, driveId) {
   try {
     var folder;
-    var folderName;
+    var resolvedFolderName = folderName;
     
-    // まずDriveAppで取得を試行
-    try {
-      folder = DriveApp.getFolderById(folderId);
-      folderName = folder.getName();
-    } catch (e) {
-      // DriveAppで取得できない場合はDrive APIを使用
-      Logger.log('DriveAppで取得失敗、Drive APIを使用: ' + e.toString());
+    // DriveAppで取得を試行（使用可能な場合のみ）
+    if (!useDriveApiOnly) {
       try {
-        var driveApiUrl = 'https://www.googleapis.com/drive/v3/files/' + folderId + '?fields=id,name,mimeType';
-        var response = UrlFetchApp.fetch(driveApiUrl, {
-          headers: {
-            'Authorization': 'Bearer ' + ScriptApp.getOAuthToken()
-          }
-        });
-        
-        if (response.getResponseCode() === 200) {
-          var fileData = JSON.parse(response.getContentText());
-          folderName = fileData.name;
-          // Drive APIを使用した処理に切り替え
-          return outputFolderContentsWithDriveAPI(folderId, folderName, sheet, existingUrls);
-        } else {
-          throw new Error('フォルダを取得できませんでした: ' + folderId);
-        }
-      } catch (e2) {
-        Logger.log('Drive APIでも取得失敗: ' + e2.toString());
-        throw new Error('フォルダを取得できませんでした: ' + folderId + ' エラー: ' + e2.toString());
+        folder = DriveApp.getFolderById(folderId);
+        resolvedFolderName = folder.getName();
+      } catch (e) {
+        Logger.log('DriveAppで取得失敗、Drive APIを使用: ' + e.toString());
       }
     }
-    
+
     if (!folder) {
-      throw new Error('フォルダを取得できませんでした: ' + folderId);
+      // Drive APIを使用した処理に切り替え
+      return outputFolderContentsWithDriveAPI(folderId, resolvedFolderName, sheet, existingUrls, driveId);
     }
 
     // フォルダの階層を取得します
-    var ancestry = folderName;
+    var ancestry = resolvedFolderName;
 
     var fileDataList = [];
     outputFolderInfo(folder, ancestry, fileDataList);
@@ -424,13 +410,13 @@ function outputFolderContents(folderId, sheet, existingUrls) {
 }
 
 // Drive APIを使用してフォルダの内容を出力する関数（共有ドライブ用）
-function outputFolderContentsWithDriveAPI(folderId, folderName, sheet, existingUrls) {
+function outputFolderContentsWithDriveAPI(folderId, folderName, sheet, existingUrls, driveId) {
   try {
     var fileDataList = [];
     var ancestry = folderName;
     
     // Drive APIを使用してファイル一覧を取得
-    outputFolderInfoWithDriveAPI(folderId, ancestry, fileDataList);
+    outputFolderInfoWithDriveAPI(folderId, ancestry, fileDataList, driveId);
 
     // シートの内容をクリアし、すべてのファイルデータを一度に書き込みます
     sheet.clearContents();
@@ -457,12 +443,12 @@ function outputFolderContentsWithDriveAPI(folderId, folderName, sheet, existingU
 }
 
 // Drive APIを使用してフォルダ情報を出力する関数（共有ドライブ用）
-function outputFolderInfoWithDriveAPI(folderId, ancestry, fileDataList) {
+function outputFolderInfoWithDriveAPI(folderId, ancestry, fileDataList, driveId) {
   try {
     var pageToken = null;
     
     do {
-      var result = getFilesFromDriveAPI(folderId, pageToken);
+      var result = getFilesFromDriveAPI(folderId, pageToken, driveId);
       
       if (!result || !result.files) {
         break;
@@ -471,9 +457,12 @@ function outputFolderInfoWithDriveAPI(folderId, ancestry, fileDataList) {
       for (var i = 0; i < result.files.length; i++) {
         var file = result.files[i];
         var type = file.mimeType === 'application/vnd.google-apps.folder' ? 'フォルダ' : 'ファイル';
+        var fallbackUrl = type === 'フォルダ'
+          ? 'https://drive.google.com/drive/folders/' + file.id
+          : 'https://drive.google.com/file/d/' + file.id + '/view';
         var fileData = {
           name: file.name,
-          url: file.webViewLink || 'https://drive.google.com/drive/folders/' + file.id,
+          url: file.webViewLink || fallbackUrl,
           type: type,
           lastUpdated: file.modifiedTime ? new Date(file.modifiedTime) : new Date(),
           owner: file.owners && file.owners.length > 0 ? file.owners[0].emailAddress : '取得不可',
@@ -484,7 +473,7 @@ function outputFolderInfoWithDriveAPI(folderId, ancestry, fileDataList) {
         // サブフォルダの場合は再帰的に処理
         if (type === 'フォルダ') {
           var subFolderAncestry = ancestry + ' > ' + file.name;
-          outputFolderInfoWithDriveAPI(file.id, subFolderAncestry, fileDataList);
+          outputFolderInfoWithDriveAPI(file.id, subFolderAncestry, fileDataList, driveId);
         }
       }
       
@@ -557,27 +546,162 @@ function getFileData(fileOrFolder, type, ancestry) {
   }
 }
 
-// 指定名で新しいシートを作成する関数
-function createSheet(ss, folderName) {
+// フォルダIDに紐づくシートを取得または作成する関数
+function getOrCreateFolderSheet(ss, folderId, folderName) {
+  var sheet = resolveFolderSheet(ss, folderId, folderName);
+  if (sheet) {
+    markSheetWithFolderId(sheet, folderId);
+    setFolderSheetMapping(folderId, sheet.getName());
+    return sheet;
+  }
+
+  var baseName = sanitizeSheetName(folderName);
+  var newSheetName = generateUniqueSheetName(ss, baseName, folderId);
+  var newSheet = createSheetByName(ss, newSheetName);
+  if (newSheet) {
+    markSheetWithFolderId(newSheet, folderId);
+    setFolderSheetMapping(folderId, newSheet.getName());
+  }
+  return newSheet;
+}
+
+// 既存シートの解決を行う
+function resolveFolderSheet(ss, folderId, folderName) {
+  var mappedName = getFolderSheetMapping(folderId);
+  if (mappedName) {
+    var mappedSheet = ss.getSheetByName(mappedName);
+    if (mappedSheet) {
+      return mappedSheet;
+    }
+  }
+
+  var sheetByNote = findSheetByFolderId(ss, folderId);
+  if (sheetByNote) {
+    return sheetByNote;
+  }
+
+  var baseName = sanitizeSheetName(folderName);
+  var candidates = findSheetCandidates(ss, baseName, folderName);
+  if (candidates.length === 1 && !hasDifferentFolderIdNote(candidates[0], folderId)) {
+    return candidates[0];
+  }
+
+  return null;
+}
+
+// シート名候補を探す
+function findSheetCandidates(ss, baseName, rawName) {
+  var sheets = ss.getSheets();
+  var candidates = [];
+  for (var i = 0; i < sheets.length; i++) {
+    var name = sheets[i].getName();
+    if (name === rawName || name === baseName || name.indexOf(baseName + '_') === 0) {
+      candidates.push(sheets[i]);
+    }
+  }
+  return candidates;
+}
+
+// フォルダIDからシートを検索（A1ノートを使用）
+function findSheetByFolderId(ss, folderId) {
+  var sheets = ss.getSheets();
+  for (var i = 0; i < sheets.length; i++) {
+    var noteId = getFolderIdNote(sheets[i]);
+    if (noteId === folderId) {
+      return sheets[i];
+    }
+  }
+  return null;
+}
+
+// シートにフォルダIDのノートを記録
+function markSheetWithFolderId(sheet, folderId) {
   try {
-    // シート名に使用できない文字を置換
-    var safeSheetName = folderName.replace(/[\/\\\?\*\[\]:]/g, '_');
-    
-    // シート名の長さ制限（31文字）に対応
-    if (safeSheetName.length > 31) {
-      safeSheetName = safeSheetName.substring(0, 31);
+    var currentId = getFolderIdNote(sheet);
+    if (currentId !== folderId) {
+      sheet.getRange(1, 1).setNote('folderId:' + folderId);
     }
-    
-    // 既に同名のシートが存在する場合は番号を付加
-    var sheetName = safeSheetName;
-    var counter = 1;
-    while (ss.getSheetByName(sheetName)) {
-      var suffix = '_' + counter;
-      var maxLength = 31 - suffix.length;
-      sheetName = safeSheetName.substring(0, maxLength) + suffix;
-      counter++;
+  } catch (e) {
+    Logger.log('シートへのフォルダID記録に失敗: ' + e.toString());
+  }
+}
+
+// A1ノートからフォルダIDを取得
+function getFolderIdNote(sheet) {
+  try {
+    var note = sheet.getRange(1, 1).getNote();
+    if (note && note.indexOf('folderId:') === 0) {
+      return note.substring('folderId:'.length);
     }
-    
+  } catch (e) {
+    // 無視
+  }
+  return null;
+}
+
+// 別フォルダのノートが付いているか確認
+function hasDifferentFolderIdNote(sheet, folderId) {
+  var noteId = getFolderIdNote(sheet);
+  return noteId && noteId !== folderId;
+}
+
+// シート名を安全な形に整形
+function sanitizeSheetName(name) {
+  var safeName = (name || '').toString().replace(/[\/\\\?\*\[\]:]/g, '_').trim();
+  if (safeName === '') {
+    safeName = 'folder';
+  }
+  if (safeName.length > 31) {
+    safeName = safeName.substring(0, 31);
+  }
+  return safeName;
+}
+
+// シート名のマッピング（Document Properties）を取得/保存
+function getFolderSheetMapping(folderId) {
+  return PropertiesService.getDocumentProperties().getProperty('folderSheet_' + folderId);
+}
+
+function setFolderSheetMapping(folderId, sheetName) {
+  PropertiesService.getDocumentProperties().setProperty('folderSheet_' + folderId, sheetName);
+}
+
+// 重複回避のためのシート名生成
+function generateUniqueSheetName(ss, baseName, folderId) {
+  var base = sanitizeSheetName(baseName);
+  var shortId = (folderId || '').replace(/[^a-zA-Z0-9]/g, '').substring(0, 6);
+  if (shortId === '') {
+    shortId = 'id';
+  }
+  var suffix = '_' + shortId;
+  var name = buildSheetNameWithSuffix(base, suffix);
+  if (!ss.getSheetByName(name)) {
+    return name;
+  }
+
+  var counter = 1;
+  while (true) {
+    var numericSuffix = '_' + counter;
+    var candidate = buildSheetNameWithSuffix(base, numericSuffix);
+    if (!ss.getSheetByName(candidate)) {
+      return candidate;
+    }
+    counter++;
+  }
+}
+
+function buildSheetNameWithSuffix(baseName, suffix) {
+  var maxLength = 31 - suffix.length;
+  var trimmed = baseName;
+  if (trimmed.length > maxLength) {
+    trimmed = trimmed.substring(0, maxLength);
+  }
+  return trimmed + suffix;
+}
+
+// 指定名で新しいシートを作成する関数
+function createSheetByName(ss, sheetName) {
+  try {
     var sheet = ss.insertSheet(sheetName);
     sheet.appendRow(['名前', 'URL', '種類', '最終更新日時', 'オーナー', 'フォルダ構成']);
     
